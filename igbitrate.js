@@ -1,9 +1,8 @@
 // ==UserScript==
-// @name         Instagram WebRTC Stream & Audio Max Power (Enhanced)
+// @name         IG WebRTC Max Quality Request (Local + Remote)
 // @namespace    https://www.instagram.com/
-// @version      2.0
-// @description  Aggressive WebRTC override: max Opus audio bitrate (~510 kbps), CBR, no DTX/FEC, tuned constraints, and 1080p30 screenshare.
-// @author       Custom
+// @version      1.0
+// @description  Requests max Opus quality both locally and in remote SDP; forces high-quality capture.
 // @match        https://www.instagram.com/*
 // @run-at       document-start
 // @grant        none
@@ -12,122 +11,120 @@
 (function () {
     'use strict';
 
-    const TARGET_AUDIO_BITRATE = 510000; // ~510 kbps
-    const TARGET_VIDEO_BITRATE = 8000000; // 8 Mbps for 1080p screenshare
+    const TARGET_AUDIO_BITRATE = 510000;   // request ~510 kbps
+    const TARGET_VIDEO_BITRATE = 8000000;  // request ~8 Mbps
 
-    // ---------- 1. SDP MUNGING FOR OPUS ----------
-    function enforceOpusParams(sdp) {
+    function enforceOpusParams(sdp, forRemote = false) {
         if (!sdp || typeof sdp !== 'string') return sdp;
 
         const lines = sdp.split('\r\n');
-        let opusPayloadType = null;
+        let opusPt = null;
 
-        // Find Opus payload type
         for (let i = 0; i < lines.length; i++) {
-            const match = lines[i].match(/^a=rtpmap:(\d+)\s+opus\/48000\/2/i);
-            if (match) {
-                opusPayloadType = match[1];
+            const m = lines[i].match(/^a=rtpmap:(\d+)\s+opus\/48000\/2/i);
+            if (m) {
+                opusPt = m[1];
                 break;
             }
         }
-
-        if (!opusPayloadType) {
-            return sdp; // No Opus, bail out safely
-        }
+        if (!opusPt) return sdp;
 
         let fmtpFound = false;
 
         for (let i = 0; i < lines.length; i++) {
-            if (lines[i].startsWith(`a=fmtp:${opusPayloadType}`)) {
+            if (lines[i].startsWith(`a=fmtp:${opusPt}`)) {
                 fmtpFound = true;
-
-                const existingFmtp = lines[i].substring(`a=fmtp:${opusPayloadType} `.length);
+                const existing = lines[i].substring(`a=fmtp:${opusPt} `.length);
                 const paramMap = new Map();
 
-                existingFmtp.split(';').forEach(p => {
-                    const [key, val] = p.trim().split('=');
-                    if (key) paramMap.set(key.trim(), val ? val.trim() : '');
+                existing.split(';').forEach(p => {
+                    const [k, v] = p.trim().split('=');
+                    if (k) paramMap.set(k.trim(), v ? v.trim() : '');
                 });
 
-                // Aggressive Opus tuning
+                // Request best quality
                 paramMap.set('maxaveragebitrate', TARGET_AUDIO_BITRATE.toString());
                 paramMap.set('stereo', '1');
                 paramMap.set('sprop-stereo', '1');
                 paramMap.set('cbr', '1');
-                paramMap.set('usedtx', '0');
-                paramMap.set('useinbandfec', '0');
+                paramMap.set('usedtx', forRemote ? '0' : '0');       // ask remote to avoid DTX too
+                paramMap.set('useinbandfec', '1');                   // request FEC if they support it
                 paramMap.set('maxplaybackrate', '48000');
+                paramMap.set('minptime', '10');
 
                 const newFmtp = Array.from(paramMap.entries())
                     .map(([k, v]) => `${k}=${v}`)
                     .join(';');
 
-                lines[i] = `a=fmtp:${opusPayloadType} ${newFmtp}`;
+                lines[i] = `a=fmtp:${opusPt} ${newFmtp}`;
                 break;
             }
         }
 
         if (!fmtpFound) {
             const fmtpLine =
-                `a=fmtp:${opusPayloadType} ` +
-                `maxaveragebitrate=${TARGET_AUDIO_BITRATE};` +
-                `stereo=1;sprop-stereo=1;cbr=1;usedtx=0;useinbandfec=0;maxplaybackrate=48000`;
-
+                `a=fmtp:${opusPt} maxaveragebitrate=${TARGET_AUDIO_BITRATE};` +
+                `stereo=1;sprop-stereo=1;cbr=1;usedtx=0;useinbandfec=1;` +
+                `maxplaybackrate=48000;minptime=10`;
             for (let i = 0; i < lines.length; i++) {
-                if (lines[i].startsWith(`a=rtpmap:${opusPayloadType}`)) {
+                if (lines[i].startsWith(`a=rtpmap:${opusPt}`)) {
                     lines.splice(i + 1, 0, fmtpLine);
                     break;
                 }
             }
         }
 
+        // Optional: add bandwidth line to m=audio
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].startsWith('m=audio')) {
+                const hasB = lines.some(l => l.startsWith('b=AS:'));
+                if (!hasB) {
+                    lines.splice(i + 1, 0, `b=AS:${Math.round(TARGET_AUDIO_BITRATE / 1000)}`);
+                }
+                break;
+            }
+        }
+
         return lines.join('\r\n');
     }
 
-    // ---------- 2. SAFE RTCPeerConnection WRAPPER ----------
     const OriginalRTCPeerConnection = window.RTCPeerConnection;
+    if (!OriginalRTCPeerConnection) return;
 
-    if (!OriginalRTCPeerConnection) {
-        console.warn('[WebRTC Mod] RTCPeerConnection not available.');
-        return;
-    }
-
-    function wrapPeerConnection(...args) {
+    function wrapPC(...args) {
         const pc = new OriginalRTCPeerConnection(...args);
 
-        // --- setLocalDescription ---
-        const originalSetLocalDescription = pc.setLocalDescription.bind(pc);
-        pc.setLocalDescription = function (description) {
+        const origSetLocal = pc.setLocalDescription.bind(pc);
+        pc.setLocalDescription = function (desc) {
             try {
-                if (description && description.sdp) {
-                    description = new RTCSessionDescription({
-                        type: description.type,
-                        sdp: enforceOpusParams(description.sdp)
+                if (desc && desc.sdp) {
+                    desc = new RTCSessionDescription({
+                        type: desc.type,
+                        sdp: enforceOpusParams(desc.sdp, false)
                     });
                 }
             } catch (e) {
-                console.warn('[WebRTC Mod] setLocalDescription SDP munging error:', e);
+                console.warn('[IG MaxQ] setLocalDescription error:', e);
             }
-            return originalSetLocalDescription(description);
+            return origSetLocal(desc);
         };
 
-        // --- setRemoteDescription ---
-        const originalSetRemoteDescription = pc.setRemoteDescription.bind(pc);
-        pc.setRemoteDescription = function (description) {
+        const origSetRemote = pc.setRemoteDescription.bind(pc);
+        pc.setRemoteDescription = function (desc) {
             try {
-                if (description && description.sdp) {
-                    description = new RTCSessionDescription({
-                        type: description.type,
-                        sdp: enforceOpusParams(description.sdp)
+                if (desc && desc.sdp) {
+                    // Request best quality from remote side too
+                    desc = new RTCSessionDescription({
+                        type: desc.type,
+                        sdp: enforceOpusParams(desc.sdp, true)
                     });
                 }
             } catch (e) {
-                console.warn('[WebRTC Mod] setRemoteDescription SDP munging error:', e);
+                console.warn('[IG MaxQ] setRemoteDescription error:', e);
             }
-            return originalSetRemoteDescription(description);
+            return origSetRemote(desc);
         };
 
-        // Helper: aggressively tune sender parameters
         async function tuneSender(sender) {
             try {
                 const params = sender.getParameters() || {};
@@ -135,68 +132,74 @@
                     params.encodings = [{}];
                 }
 
-                if (sender.track && sender.track.kind === 'audio') {
-                    params.encodings.forEach(enc => {
+                params.encodings.forEach(enc => {
+                    if (sender.track && sender.track.kind === 'audio') {
                         enc.maxBitrate = TARGET_AUDIO_BITRATE;
-                        enc.dtx = false; // boolean, not string
-                    });
-                } else if (sender.track && sender.track.kind === 'video') {
-                    params.encodings.forEach(enc => {
+                        enc.dtx = false;
+                    } else if (sender.track && sender.track.kind === 'video') {
                         enc.maxBitrate = TARGET_VIDEO_BITRATE;
                         enc.degradationPreference = 'maintain-framerate';
-                    });
-                }
+                    }
+                });
 
                 await sender.setParameters(params);
             } catch (e) {
-                console.warn('[WebRTC Mod] Error tuning RTCRtpSender parameters:', e);
+                console.warn('[IG MaxQ] tuneSender error:', e);
             }
         }
 
-        // --- addTrack ---
-        const originalAddTrack = pc.addTrack.bind(pc);
-        pc.addTrack = function (...addTrackArgs) {
-            const sender = originalAddTrack(...addTrackArgs);
-            if (sender) {
-                // Delay slightly to let browser populate parameters
-                setTimeout(() => tuneSender(sender), 300);
-            }
+        const origAddTrack = pc.addTrack.bind(pc);
+        pc.addTrack = function (...trackArgs) {
+            const sender = origAddTrack(...trackArgs);
+            if (sender) setTimeout(() => tuneSender(sender), 300);
             return sender;
         };
 
-        // --- addTransceiver (for modern pipelines) ---
         if (pc.addTransceiver) {
-            const originalAddTransceiver = pc.addTransceiver.bind(pc);
+            const origAddTransceiver = pc.addTransceiver.bind(pc);
             pc.addTransceiver = function (...txArgs) {
-                const transceiver = originalAddTransceiver(...txArgs);
-                if (transceiver && transceiver.sender) {
-                    setTimeout(() => tuneSender(transceiver.sender), 300);
-                }
-                return transceiver;
+                const tx = origAddTransceiver(...txArgs);
+                if (tx && tx.sender) setTimeout(() => tuneSender(tx.sender), 300);
+                return tx;
             };
         }
 
         return pc;
     }
 
-    window.RTCPeerConnection = wrapPeerConnection;
+    window.RTCPeerConnection = wrapPC;
     window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
 
-    // ---------- 3. MEDIA CONSTRAINTS OVERRIDES ----------
+    // Capture-side: request best local quality
     if (navigator.mediaDevices) {
-        // --- getDisplayMedia: force 1080p30 screenshare ---
-        if (navigator.mediaDevices.getDisplayMedia) {
-            const originalGetDisplayMedia =
-                navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+        if (navigator.mediaDevices.getUserMedia) {
+            const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+            navigator.mediaDevices.getUserMedia = function (constraints = {}) {
+                if (!constraints.audio) return origGetUserMedia(constraints);
 
+                if (typeof constraints.audio === 'boolean') {
+                    constraints.audio = {};
+                }
+
+                const audio = constraints.audio;
+                audio.echoCancellation = false;
+                audio.noiseSuppression = false;
+                audio.autoGainControl = false;
+                audio.sampleRate = audio.sampleRate || { ideal: 48000 };
+                audio.channelCount = audio.channelCount || { ideal: 2 };
+
+                return origGetUserMedia(constraints);
+            };
+        }
+
+        if (navigator.mediaDevices.getDisplayMedia) {
+            const origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
             navigator.mediaDevices.getDisplayMedia = function (constraints = {}) {
                 const forcedVideo = {
                     width: { ideal: 1920, max: 1920 },
                     height: { ideal: 1080, max: 1080 },
-                    frameRate: { ideal: 30, max: 30 },
-                    displaySurface: 'monitor'
+                    frameRate: { ideal: 30, max: 30 }
                 };
-
                 const forcedAudio = {
                     echoCancellation: false,
                     noiseSuppression: false,
@@ -205,42 +208,15 @@
                     channelCount: 2
                 };
 
-                const mergedConstraints = {
+                const merged = {
                     video: Object.assign({}, forcedVideo, constraints.video || {}),
                     audio: Object.assign({}, forcedAudio, constraints.audio || {})
                 };
 
-                return originalGetDisplayMedia(mergedConstraints);
-            };
-        }
-
-        // --- getUserMedia: tune audio input ---
-        if (navigator.mediaDevices.getUserMedia) {
-            const originalGetUserMedia =
-                navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-
-            navigator.mediaDevices.getUserMedia = function (constraints = {}) {
-                if (!constraints.audio) {
-                    return originalGetUserMedia(constraints);
-                }
-
-                if (typeof constraints.audio === 'boolean') {
-                    constraints.audio = {};
-                }
-
-                const audio = constraints.audio;
-
-                audio.echoCancellation = false;
-                audio.noiseSuppression = false;
-                audio.autoGainControl = false;
-
-                audio.sampleRate = audio.sampleRate || { ideal: 48000 };
-                audio.channelCount = audio.channelCount || { ideal: 2 };
-
-                return originalGetUserMedia(constraints);
+                return origGetDisplayMedia(merged);
             };
         }
     }
 
-    console.log('[WebRTC Engine Overrider] Enhanced Instagram profile active.');
+    console.log('[IG MaxQ] Local + remote quality request active.');
 })();
