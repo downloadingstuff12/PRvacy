@@ -1,121 +1,160 @@
 // ==UserScript==
-// @name         Instagram Call Max Quality Injector (510k Audio + 60fps Video)
-// @namespace    https://instagram.com/
+// @name         Instagram WebRTC Ultra-HQ Override (v4.0)
+// @namespace    http://tampermonkey.net/
 // @version      4.0
-// @description  Overrides Audio (510kbps) and Video/Screenshare FPS (60fps) in WebRTC SDPs.
+// @description  Forces 1080p@30fps, 12Mbps video bitrate, 510kbps stereo audio, and disables resolution downscaling on Instagram WebRTC streams.
 // @author       You
 // @match        https://www.instagram.com/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=instagram.com
 // @grant        none
 // @run-at       document-start
-// ==/UserScript==
+// ==UserScript==
 
-(function() {
+(function () {
     'use strict';
 
-    // Target Settings
-    const AUDIO_BITRATE = 510000;  // 510 kbps
-    const AUDIO_KBPS = 510;
-    const AUDIO_SAMPLE_RATE = 48000;
+    const TARGET_WIDTH = 1920;
+    const TARGET_HEIGHT = 1080;
+    const TARGET_FPS = 30;
+    const VIDEO_MAX_BITRATE_BPS = 12000000; // 12 Mbps for zero blockiness
+    const AUDIO_MAX_BITRATE_BPS = 510000;   // 510 kbps max Opus audio
 
-    const VIDEO_FPS = 60;           // Target 60 FPS for Video/Screenshare
-    const VIDEO_KBPS = 6000;        // 6 Mbps bandwidth allocation for video
-    const VIDEO_BITRATE = 6000000;
+    console.log('[HQ-WebRTC 4.0] Initializing High-Fidelity WebRTC Engine Interceptor...');
 
-    function modifySDP(sdp) {
-        if (!sdp) return sdp;
-
-        let lines = sdp.split('\r\n');
-        let currentMediaType = null; // 'audio' or 'video'
-
-        for (let i = 0; i < lines.length; i++) {
-            // Detect media section
-            if (lines[i].startsWith('m=audio')) {
-                currentMediaType = 'audio';
-            } else if (lines[i].startsWith('m=video')) {
-                currentMediaType = 'video';
-            }
-
-            // --- AUDIO MODIFICATIONS ---
-            if (currentMediaType === 'audio') {
-                if (lines[i].startsWith('a=fmtp:') && lines[i].toLowerCase().includes('maxaveragebitrate')) {
-                    // Strip server limits and enforce max bandwidth + stereo
-                    lines[i] = lines[i].replace(/maxaveragebitrate=\d+;?/g, '')
-                                      .replace(/maxplaybackrate=\d+;?/g, '')
-                                      .replace(/stereo=\d+;?/g, '')
-                                      .replace(/sprop-stereo=\d+;?/g, '')
-                                      .replace(/cbr=\d+;?/g, '')
-                                      .replace(/usedtx=\d+;?/g, '')
-                                      .replace(/;\s*$/, '');
-
-                    lines[i] += `;maxaveragebitrate=${AUDIO_BITRATE};maxplaybackrate=${AUDIO_SAMPLE_RATE};stereo=1;sprop-stereo=1;cbr=1;usedtx=0`;
-                }
-            }
-
-            // --- VIDEO / SCREENSHARE MODIFICATIONS ---
-            if (currentMediaType === 'video') {
-                if (lines[i].startsWith('a=fmtp:')) {
-                    // Inject max-fr (framerate) parameter into video codecs if not present
-                    if (!lines[i].includes('max-fr=')) {
-                        lines[i] += `;max-fr=${VIDEO_FPS}`;
-                    } else {
-                        lines[i] = lines[i].replace(/max-fr=\d+/g, `max-fr=${VIDEO_FPS}`);
-                    }
-                }
-            }
+    // -------------------------------------------------------------
+    // 1. Intercept media devices to demand raw 1080p @ 30fps
+    // -------------------------------------------------------------
+    const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async function (constraints) {
+        if (constraints && constraints.video) {
+            console.log('[HQ-WebRTC 4.0] Overriding Video Constraints to 1080p 30fps...');
+            constraints.video = {
+                width: { exact: TARGET_WIDTH, ideal: TARGET_WIDTH },
+                height: { exact: TARGET_HEIGHT, ideal: TARGET_HEIGHT },
+                frameRate: { exact: TARGET_FPS, ideal: TARGET_FPS }
+            };
         }
 
-        // Re-build SDP and inject transport bandwidth caps (b=AS / b=TIAS)
-        let modifiedLines = [];
-        currentMediaType = null;
-
-        for (let i = 0; i < lines.length; i++) {
-            modifiedLines.push(lines[i]);
-
-            if (lines[i].startsWith('m=audio')) {
-                modifiedLines.push(`b=AS:${AUDIO_KBPS}`);
-                modifiedLines.push(`b=TIAS:${AUDIO_BITRATE}`);
-            } else if (lines[i].startsWith('m=video')) {
-                modifiedLines.push(`b=AS:${VIDEO_KBPS}`);
-                modifiedLines.push(`b=TIAS:${VIDEO_BITRATE}`);
-                modifiedLines.push(`a=framerate:${VIDEO_FPS}`);
-            }
+        if (constraints && constraints.audio) {
+            console.log('[HQ-WebRTC 4.0] Enforcing Unprocessed Stereo Audio Capture...');
+            constraints.audio = {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                channelCount: 2,
+                sampleRate: 48000
+            };
         }
 
-        return modifiedLines.join('\r\n');
+        return origGetUserMedia(constraints);
+    };
+
+    if (navigator.mediaDevices.getDisplayMedia) {
+        const origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+        navigator.mediaDevices.getDisplayMedia = async function (constraints) {
+            if (constraints) {
+                constraints.video = {
+                    width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
+                    height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+                    frameRate: { ideal: TARGET_FPS, max: TARGET_FPS }
+                };
+            }
+            return origGetDisplayMedia(constraints);
+        };
     }
 
-    // Intercept WebRTC PeerConnection
-    const OrigRTCPeerConnection = window.RTCPeerConnection;
+    // -------------------------------------------------------------
+    // 2. SDP Manging (Inject Bitrate Limits & Opus Stereo Ceiling)
+    // -------------------------------------------------------------
+    function optimizeSDP(sdp) {
+        let lines = sdp.split('\r\n');
+        let inVideo = false;
 
-    window.RTCPeerConnection = function(...args) {
-        const pc = new OrigRTCPeerConnection(...args);
-
-        const origSetLocalDescription = pc.setLocalDescription;
-        pc.setLocalDescription = function(description) {
-            if (description && description.sdp) {
-                description = new RTCSessionDescription({
-                    type: description.type,
-                    sdp: modifySDP(description.sdp)
-                });
-                console.log('[WebRTC Injector] Local SDP modified (510k Audio / 60fps Video).');
+        for (let i = 0; i < lines.length; i++) {
+            // Audio OPUS Parameter Injection
+            if (lines[i].includes('a=fmtp:111')) {
+                lines[i] = lines[i] + ';stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1;maxplaybackrate=48000';
             }
-            return origSetLocalDescription.apply(this, [description]);
+
+            // Detect Video Section
+            if (lines[i].startsWith('m=video')) {
+                inVideo = true;
+            } else if (lines[i].startsWith('m=audio') || lines[i].startsWith('m=application')) {
+                inVideo = false;
+            }
+
+            // Inject TIAS Bandwidth Parameter under m=video
+            if (inVideo && lines[i].startsWith('c=IN')) {
+                lines.splice(i + 1, 0, `b=TIAS:${VIDEO_MAX_BITRATE_BPS}`);
+                i++;
+            }
+        }
+        return lines.join('\r\n');
+    }
+
+    // -------------------------------------------------------------
+    // 3. Intercept PeerConnection to lock senders & maintain resolution
+    // -------------------------------------------------------------
+    const OrigPeerConnection = window.RTCPeerConnection;
+
+    window.RTCPeerConnection = function (...args) {
+        const pc = new OrigPeerConnection(...args);
+
+        // Intercept Local & Remote Description calls for SDP modification
+        const origSetLocalDescription = pc.setLocalDescription.bind(pc);
+        pc.setLocalDescription = function (description) {
+            if (description && description.sdp) {
+                description.sdp = optimizeSDP(description.sdp);
+            }
+            return origSetLocalDescription(description);
         };
 
-        const origSetRemoteDescription = pc.setRemoteDescription;
-        pc.setRemoteDescription = function(description) {
+        const origSetRemoteDescription = pc.setRemoteDescription.bind(pc);
+        pc.setRemoteDescription = function (description) {
             if (description && description.sdp) {
-                description = new RTCSessionDescription({
-                    type: description.type,
-                    sdp: modifySDP(description.sdp)
-                });
-                console.log('[WebRTC Injector] Remote SDP Offer overridden.');
+                description.sdp = optimizeSDP(description.sdp);
             }
-            return origSetRemoteDescription.apply(this, [description]);
+            return origSetRemoteDescription(description);
         };
+
+        // Enforce RTCRtpSender parameters on track negotiation
+        pc.addEventListener('track', () => {
+            applyHighQualitySenderParams(pc);
+        });
+
+        pc.addEventListener('connectionstatechange', () => {
+            if (pc.connectionState === 'connected') {
+                applyHighQualitySenderParams(pc);
+            }
+        });
 
         return pc;
     };
 
-    window.RTCPeerConnection.prototype = OrigRTCPeerConnection.prototype;
+    window.RTCPeerConnection.prototype = OrigPeerConnection.prototype;
+
+    async function applyHighQualitySenderParams(pc) {
+        const senders = pc.getSenders();
+        for (const sender of senders) {
+            if (sender.track && sender.track.kind === 'video') {
+                const params = sender.getParameters();
+                if (!params.encodings || params.encodings.length === 0) {
+                    params.encodings = [{}];
+                }
+
+                // Lock Max Bitrate & Prevent Quality/Resolution Lowering
+                params.encodings[0].maxBitrate = VIDEO_MAX_BITRATE_BPS;
+                params.encodings[0].maxFramerate = TARGET_FPS;
+                params.degradationPreference = 'maintain-resolution';
+
+                try {
+                    await sender.setParameters(params);
+                    console.log('[HQ-WebRTC 4.0] Successfully forced 12Mbps Bitrate & Maintain-Resolution on Video Sender.');
+                } catch (e) {
+                    console.warn('[HQ-WebRTC 4.0] Sender parameters update non-critical warning:', e);
+                }
+            }
+        }
+    }
+
 })();
